@@ -43,7 +43,18 @@ def node_analyze(state: ReviewState) -> dict:
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": (
+                "Senior reviewer. Structured output. "
+                "`confidence` = how safe it is to post your review WITHOUT a human looking at the PR. "
+                f"Use >= {AUTO_APPROVE_THRESHOLD:.2f} only for mechanical changes (typos, docs, version bumps, "
+                "trivial refactors) with no behaviour risk. "
+                f"Use {ESCALATE_THRESHOLD:.2f}–{AUTO_APPROVE_THRESHOLD - 0.01:.2f} for functional changes that look "
+                "correct but leave at least one open question a human should confirm (schema/data migration, "
+                "backward compatibility, edge cases, missing tests). "
+                f"Use < {ESCALATE_THRESHOLD:.2f} when the PR touches security-sensitive code (auth, passwords, "
+                "crypto, tokens, SQL, network sync) or has several serious issues, or its intent is unclear. "
+                "Do not default to high confidence."
+            )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
@@ -63,17 +74,17 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    # interrupt() pauses here; on resume it returns whatever Command(resume=...) carried.
+    # No side-effects before this line — the node re-runs from the top on resume.
+    response = interrupt({
+        "kind": "approval_request",
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -133,8 +144,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +184,11 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    # `while`, not `if`: after one resume the graph may pause again.
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
